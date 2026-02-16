@@ -2,7 +2,7 @@
 
 **Veteran-Owned | Public Benefit Cooperative | AI Jobs for Veterans**
 
-1st Hope Corps, LCA is a veteran-owned nonprofit public benefit cooperative dedicated to building and deploying responsible artificial intelligence solutions while creating meaningful AI career pathways for U.S. Veterans.
+1st Hope Corps, LCA is a veteran-owned nonprofit public benefit cooperative dedicated to building and deploying responsible artificial intelligence solutions while creating meaningful AI jobs for U.S. Veterans.
 
 ---
 
