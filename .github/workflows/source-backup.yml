@@ -1,0 +1,110 @@
+# Source backup: see "Source Code Backup Plan" (1stHope).
+# Identical in every 1st-Hope-Corps repository. Do not edit per repository.
+name: Source backup
+
+on:
+  # Any branch, so the same file works whatever the default branch is called.
+  # The job below only proceeds for pushes to this repository's default branch.
+  push:
+  schedule:
+    - cron: '17 3 * * 0'  # off the top of the hour: GitHub delays or drops :00 schedules under load
+  workflow_dispatch:
+    inputs:
+      archive:
+        description: 'Final snapshot before archiving this repository (kept indefinitely)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+# GitHub Free: private repositories cannot read organization variables, so these
+# non-secret values live here instead.
+env:
+  BACKUP_BUCKET: 1sthope-source-backups
+  GCP_WIF_PROVIDER: projects/610485750833/locations/global/workloadIdentityPools/github/providers/github-actions
+  GCP_BACKUP_SA: source-backup@repository-backup-510917.iam.gserviceaccount.com
+
+jobs:
+  backup:
+    if: github.event_name != 'push' || github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30  # a hung run fails and notifies instead of holding the concurrency slot
+    # Job-level, so skipped feature-branch pushes never enter the group and never
+    # replace a waiting default-branch run.
+    concurrency:
+      group: source-backup-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Fetch branches and tags into a bare repository
+        run: |
+          git init --bare mirror.git
+          # Fetch from the URL, not a named remote: a named remote also writes
+          # refs/remotes/origin/* into the bundle, which a restore's push --mirror
+          # would then push into the new repository.
+          URL="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git -C mirror.git fetch "$URL" '+refs/heads/*:refs/heads/*' '+refs/tags/*:refs/tags/*'
+          # Ask the remote for its default branch. This works on every event type;
+          # the schedule event payload has no repository object to read it from.
+          DEFAULT=$(git -C mirror.git ls-remote --symref "$URL" HEAD | awk '/^ref:/ {print $2}')
+          git -C mirror.git symbolic-ref HEAD "$DEFAULT"
+
+      - name: Build and verify archive and bundle
+        run: |
+          SHA=$(git -C mirror.git rev-parse HEAD)
+          HASH=$(git -C mirror.git rev-parse --short HEAD)
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            PREFIX=weekly
+          elif [ "${{ inputs.archive }}" = "true" ]; then
+            PREFIX=archive
+          else
+            PREFIX=merges
+          fi
+          NAME="$PREFIX/${{ github.repository }}/$(date -u +%Y-%m-%dT%H%MZ)_${HASH}_${{ github.run_id }}"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          echo "SHA=$SHA" >> "$GITHUB_ENV"
+          git -C mirror.git archive --format=zip --output=../archive.zip HEAD
+          git -C mirror.git bundle create ../repo.bundle --all
+          # Fail the run, rather than upload a broken file, if the bundle is not self-contained.
+          git -C mirror.git bundle verify ../repo.bundle
+
+      # Pinned to a full commit SHA, not a tag: this action receives the OIDC token,
+      # so a moved tag here is a credential-theft vector.
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093  # v3.0.0
+        with:
+          workload_identity_provider: ${{ env.GCP_WIF_PROVIDER }}
+          service_account: ${{ env.GCP_BACKUP_SA }}
+          token_format: access_token
+
+      # Uploads go straight to the Cloud Storage JSON API rather than through
+      # `gcloud storage cp`, which reads the destination first (storage.objects.get)
+      # and so cannot run under the create-only role. ifGenerationMatch=0 makes
+      # each upload fail rather than overwrite an existing object.
+      - name: Upload to bucket
+        env:
+          TOKEN: ${{ steps.auth.outputs.access_token }}
+        run: |
+          set -euo pipefail
+          upload() {
+            local file="$1" object="$2" content_type="$3"
+            # The full commit hash goes into object metadata; the file name keeps the short one.
+            local session
+            session=$(curl -sS --fail-with-body -X POST -D - -o /dev/null \
+              -H "Authorization: Bearer $TOKEN" \
+              -H "Content-Type: application/json; charset=UTF-8" \
+              -H "X-Upload-Content-Type: $content_type" \
+              --data "{\"name\":\"$object\",\"metadata\":{\"commit\":\"$SHA\"}}" \
+              "https://storage.googleapis.com/upload/storage/v1/b/${BACKUP_BUCKET}/o?uploadType=resumable&ifGenerationMatch=0" \
+              | tr -d '\r' | awk 'tolower($1) == "location:" {print $2}')
+            if [ -z "$session" ]; then
+              echo "::error::Could not start the upload of $object"
+              exit 1
+            fi
+            curl -sS --fail-with-body -X PUT --upload-file "$file" \
+              -H "Content-Type: $content_type" "$session" -o /dev/null
+            echo "Uploaded gs://${BACKUP_BUCKET}/$object"
+          }
+          upload archive.zip "$NAME.zip" application/zip
+          upload repo.bundle "$NAME.bundle" application/octet-stream
