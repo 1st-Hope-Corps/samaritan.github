@@ -22,6 +22,9 @@ permissions:
 # GitHub Free: private repositories cannot read organization variables, so these
 # non-secret values live here instead.
 env:
+  # Git LFS files are kept as their pointer files: the zip and bundle never try to
+  # download LFS content, which this job has no credentials for (see plan scope).
+  GIT_LFS_SKIP_SMUDGE: '1'
   BACKUP_BUCKET: 1sthope-source-backups
   GCP_WIF_PROVIDER: projects/610485750833/locations/global/workloadIdentityPools/github/providers/github-actions
   GCP_BACKUP_SA: source-backup@repository-backup-510917.iam.gserviceaccount.com
